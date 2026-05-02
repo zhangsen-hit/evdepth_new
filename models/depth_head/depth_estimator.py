@@ -26,14 +26,13 @@ from data.utils.types import BackboneFeatures, LstmStates
 class DepthEstimator(th.nn.Module):
     """
     Depth estimation network
-    Reuses backbone and FPN from detection, adds UNet-style depth decoder
+    Reuses backbone and FPN from detection, adds UNet-style depth decoder;
+    optional E2DepthConvLSTMUNet end-to-end path (no FPN / legacy depth_head).
     """
 
     def __init__(self, model_cfg: Dict[str, Any]):
         super().__init__()
         backbone_cfg = model_cfg["backbone"]
-        fpn_cfg = model_cfg["fpn"]
-        head_cfg = model_cfg["head"]
         loss_cfg = model_cfg.get("loss", {})
         depth_range_cfg = model_cfg.get("depth_range", {})
         min_depth = depth_range_cfg.get("min", 0.5) if isinstance(depth_range_cfg, dict) else 0.5
@@ -41,35 +40,62 @@ class DepthEstimator(th.nn.Module):
 
         # Build backbone
         self.backbone = build_recurrent_backbone(backbone_cfg)
+        self._e2depth = bool(getattr(self.backbone, "is_end_to_end_depth", False))
 
-        # Build FPN
-        in_channels = self.backbone.get_stage_dims(tuple(fpn_cfg["in_stages"]))
-        self.fpn = build_yolox_fpn(fpn_cfg, in_channels=in_channels)
+        if self._e2depth:
+            self.fpn = None
+            self.depth_head = None
+        else:
+            fpn_cfg = model_cfg.get("fpn")
+            head_cfg = model_cfg.get("head")
+            if not isinstance(fpn_cfg, dict) or not isinstance(head_cfg, dict):
+                raise ValueError(
+                    "model.fpn and model.head must be dict configs when backbone is not E2DepthConvLSTMUNet"
+                )
+            in_channels = self.backbone.get_stage_dims(tuple(fpn_cfg["in_stages"]))
+            self.fpn = build_yolox_fpn(fpn_cfg, in_channels=in_channels)
+            skip_quarter_ch = self.backbone.get_stage_dims((1,))[0]
+            self.depth_head = build_depth_head(
+                head_cfg, in_channels=in_channels, skip_quarter_channels=skip_quarter_ch
+            )
 
-        # Stage-1 (/4) RNN output as decoder skip at /4 (FPN only feeds stages 2–4)
-        skip_quarter_ch = self.backbone.get_stage_dims((1,))[0]
-        self.depth_head = build_depth_head(
-            head_cfg, in_channels=in_channels, skip_quarter_channels=skip_quarter_ch
-        )
-
-        # Build loss function
         far_weight_cfg = loss_cfg.get("far_weight", {}) or {}
         if not isinstance(far_weight_cfg, dict):
             far_weight_cfg = {}
-        self.loss_fn = DepthLoss(
-            silog_weight=loss_cfg.get("silog_weight", 1.0),
-            grad_weight=loss_cfg.get("grad_weight", 0.5),
-            silog_lambda=loss_cfg.get("silog_lambda", 0.5),
-            scales=loss_cfg.get("scales", [1, 2, 4, 8, 16]),
+
+        composition = loss_cfg.get("composition", "full")
+
+        loss_common = dict(
+            composition=composition,
             depth_min=min_depth,
             depth_max=max_depth,
-            far_weight_alpha=far_weight_cfg.get("alpha", 0.0),
-            far_weight_t0=far_weight_cfg.get("t0", 0.3),
-            lap_weight=loss_cfg.get("lap_weight", 0.3),
-            event_edge_sigma=loss_cfg.get("event_edge_sigma", 3.0),
-            event_edge_grad_ratio=loss_cfg.get("event_edge_grad_ratio", 0.5),
-            scale1_weight_mul=loss_cfg.get("scale1_weight_mul", 2.5),
         )
+
+        if composition == "sigrad_only":
+            self.loss_fn = DepthLoss(
+                **loss_common,
+                si_weight=float(loss_cfg.get("si_weight", 1.0)),
+                si_lambda=float(loss_cfg.get("si_lambda", loss_cfg.get("silog_lambda", 1.0))),
+                grad_weight=float(loss_cfg.get("grad_weight", 0.25)),
+                grad_start_scale=int(loss_cfg.get("grad_start_scale", 1)),
+                grad_num_scales=int(loss_cfg.get("grad_num_scales", 4)),
+            )
+        else:
+            self.loss_fn = DepthLoss(
+                composition="full",
+                depth_min=min_depth,
+                depth_max=max_depth,
+                silog_weight=loss_cfg.get("silog_weight", 1.0),
+                grad_weight=loss_cfg.get("grad_weight", 0.25),
+                silog_lambda=loss_cfg.get("silog_lambda", 1.0),
+                scales=loss_cfg.get("scales", [1, 2, 4, 8, 16]),
+                far_weight_alpha=far_weight_cfg.get("alpha", 0.0),
+                far_weight_t0=far_weight_cfg.get("t0", 0.3),
+                lap_weight=loss_cfg.get("lap_weight", 0.0),
+                event_edge_sigma=loss_cfg.get("event_edge_sigma", 3.0),
+                event_edge_grad_ratio=loss_cfg.get("event_edge_grad_ratio", 0.5),
+                scale1_weight_mul=loss_cfg.get("scale1_weight_mul", 2.5),
+            )
 
     def forward_backbone(
         self,
@@ -150,11 +176,28 @@ class DepthEstimator(th.nn.Module):
             losses: dict with loss values (None if not training)
             states: updated RNN states
         """
+        predictions, losses = None, None
+
+        if self._e2depth:
+            with CudaTimer(device=x.device, timer_name="E2DepthUNet"):
+                predictions, states = self.backbone.forward_depth_and_states(
+                    x, previous_states
+                )
+            if not retrieve_depth:
+                assert targets is None
+                return None, None, states
+            if targets is not None:
+                with CudaTimer(device=x.device, timer_name="Depth Loss"):
+                    _, losses_dict = self.loss_fn(
+                        predictions, targets, masks, None
+                    )
+                losses = losses_dict
+            return predictions, losses, states
+
         backbone_features, states = self.forward_backbone(
             x, previous_states, token_mask
         )
 
-        predictions, losses = None, None
         if not retrieve_depth:
             assert targets is None
             return predictions, losses, states

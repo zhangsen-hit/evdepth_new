@@ -17,6 +17,47 @@ from data.genx_utils.labels import SparselyBatchedObjectLabels
 from data.utils.types import DataType, LoaderDataDictGenX
 
 
+def center_crop_tensor_2d(
+    tensor: torch.Tensor,
+    out_h: int,
+    out_w: int,
+) -> torch.Tensor:
+    """
+    对末尾两维空间维做居中裁剪：(C,H,W) 或其它 (*, H, W)。
+    若 spatial 尺寸小于目标则不抛错，仅按可用范围截取。
+    """
+    h = int(tensor.shape[-2])
+    w = int(tensor.shape[-1])
+    if h >= out_h:
+        top = max(0, (h - out_h) // 2)
+        bot = top + out_h
+    else:
+        top, bot = 0, h
+    if w >= out_w:
+        left = max(0, (w - out_w) // 2)
+        right = left + out_w
+    else:
+        left, right = 0, w
+    return tensor[..., top:bot, left:right]
+
+
+def normalize_events_nonzero_channels(ev_t: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    """
+    ev_t: (C, H, W)。逐通道在非零位置上减均值除以标准差；零保持为零。
+    """
+    assert ev_t.dim() == 3
+    out = ev_t.clone()
+    for c in range(out.shape[0]):
+        plane = out[c]
+        nz = plane != 0
+        if nz.any():
+            vals = plane[nz]
+            mu = vals.mean()
+            sig = vals.std(unbiased=False).clamp(min=eps)
+            plane[nz] = (plane[nz] - mu) / sig
+    return out
+
+
 # 默认 npz 中事件与深度的 key（可配置）
 # 常见结构: input=(2,260,346) 事件, label=(260,346) 深度（含 inf 为无效）
 DEFAULT_EV_KEY = "input"
@@ -148,6 +189,8 @@ class LiosamSequenceForIter(Dataset):
         min_depth: float = 0.1,
         max_depth: float = 100.0,
         convert_depth_to_log: bool = True,
+        center_crop_hw: Optional[Tuple[int, int]] = None,
+        normalize_events_nonzero: bool = False,
     ):
         self.path = path
         self.frame_indices = frame_indices  # indices into entries for this sequence
@@ -159,17 +202,26 @@ class LiosamSequenceForIter(Dataset):
         self.min_depth = min_depth
         self.max_depth = max_depth
         self.convert_depth_to_log = convert_depth_to_log
+        self.center_crop_hw = (
+            tuple(int(x) for x in center_crop_hw) if center_crop_hw is not None else None
+        )
+        self.normalize_events_nonzero = bool(normalize_events_nonzero)
         self._padding_representation = None
         assert len(frame_indices) == sequence_length
 
     @property
     def padding_representation(self) -> torch.Tensor:
         if self._padding_representation is None:
-            # 从第一帧取形状
             fn = self.path / self.entries[self.frame_indices[0]][2]
             data = np.load(str(fn), allow_pickle=True)
             ev = data[self.ev_key]
-            self._padding_representation = torch.zeros_like(torch.from_numpy(ev))
+            t = torch.zeros_like(torch.from_numpy(ev).float())
+            if t.dim() == 2:
+                t = t.unsqueeze(0)
+            if self.center_crop_hw is not None:
+                ch, cw = self.center_crop_hw
+                t = center_crop_tensor_2d(t, ch, cw)
+            self._padding_representation = t
         return self._padding_representation
 
     def get_fully_padded_sample(self) -> LoaderDataDictGenX:
@@ -210,12 +262,21 @@ class LiosamSequenceForIter(Dataset):
             ev_t = torch.from_numpy(ev).float()
             if ev_t.dim() == 2:
                 ev_t = ev_t.unsqueeze(0)
+            if self.center_crop_hw is not None:
+                ch, cw = self.center_crop_hw
+                ev_t = center_crop_tensor_2d(ev_t, ch, cw)
+            if self.normalize_events_nonzero:
+                ev_t = normalize_events_nonzero_channels(ev_t)
             ev_repr.append(ev_t)
 
             depth, mask_t = _load_depth_and_mask_from_npz(
                 data, self.depth_key, self.depth_mask_key,
                 self.min_depth, self.max_depth, self.convert_depth_to_log,
             )
+            if self.center_crop_hw is not None:
+                ch, cw = self.center_crop_hw
+                depth = center_crop_tensor_2d(depth, ch, cw)
+                mask_t = center_crop_tensor_2d(mask_t, ch, cw)
             depths.append(depth)
             masks.append(mask_t)
 
@@ -249,6 +310,8 @@ class LiosamSequenceForRandomAccess:
         min_depth: float = 0.1,
         max_depth: float = 100.0,
         convert_depth_to_log: bool = True,
+        center_crop_hw: Optional[Tuple[int, int]] = None,
+        normalize_events_nonzero: bool = False,
     ):
         self.path = path
         self.frame_indices = frame_indices
@@ -260,6 +323,10 @@ class LiosamSequenceForRandomAccess:
         self.min_depth = min_depth
         self.max_depth = max_depth
         self.convert_depth_to_log = convert_depth_to_log
+        self.center_crop_hw = (
+            tuple(int(x) for x in center_crop_hw) if center_crop_hw is not None else None
+        )
+        self.normalize_events_nonzero = bool(normalize_events_nonzero)
         self.length = 1
         self._only_load_labels = False
 
@@ -279,12 +346,21 @@ class LiosamSequenceForRandomAccess:
             ev_t = torch.from_numpy(ev).float()
             if ev_t.dim() == 2:
                 ev_t = ev_t.unsqueeze(0)
+            if self.center_crop_hw is not None:
+                ch, cw = self.center_crop_hw
+                ev_t = center_crop_tensor_2d(ev_t, ch, cw)
+            if self.normalize_events_nonzero:
+                ev_t = normalize_events_nonzero_channels(ev_t)
             ev_repr.append(ev_t)
 
             depth, mask_t = _load_depth_and_mask_from_npz(
                 data, self.depth_key, self.depth_mask_key,
                 self.min_depth, self.max_depth, self.convert_depth_to_log,
             )
+            if self.center_crop_hw is not None:
+                ch, cw = self.center_crop_hw
+                depth = center_crop_tensor_2d(depth, ch, cw)
+                mask_t = center_crop_tensor_2d(mask_t, ch, cw)
             depths.append(depth)
             masks.append(mask_t)
 
@@ -313,6 +389,9 @@ class LiosamSequenceForRandomAccess:
 def _extract_common_config(dataset_config: Dict[str, Any]) -> Dict[str, Any]:
     """从 dataset_config 中提取构建序列所需的公共参数。"""
     depth_range = dataset_config.get("depth_range", {})
+    chw = dataset_config.get("center_crop_hw", None)
+    if chw is not None:
+        chw = tuple(int(x) for x in chw)
     return dict(
         sequence_length=dataset_config["sequence_length"],
         min_dt=dataset_config.get("frame_interval_sec", 0.005) - dataset_config.get("max_interval_deviation_sec", 0.003),
@@ -322,6 +401,8 @@ def _extract_common_config(dataset_config: Dict[str, Any]) -> Dict[str, Any]:
         depth_mask_key=dataset_config.get("depth_mask_key", DEFAULT_DEPTH_MASK_KEY),
         min_depth=float(depth_range.get("min", 0.1)),
         max_depth=float(depth_range.get("max", 100.0)),
+        center_crop_hw=chw,
+        normalize_events_nonzero=bool(dataset_config.get("normalize_events_nonzero", False)),
     )
 
 
@@ -368,6 +449,8 @@ def _make_stream_list(
             min_depth=cfg["min_depth"],
             max_depth=cfg["max_depth"],
             convert_depth_to_log=True,
+            center_crop_hw=cfg.get("center_crop_hw"),
+            normalize_events_nonzero=cfg.get("normalize_events_nonzero", False),
         )
         for scene_path, entries, wnd in windows
     ]
@@ -389,6 +472,8 @@ def _make_rnd_list(
             min_depth=cfg["min_depth"],
             max_depth=cfg["max_depth"],
             convert_depth_to_log=True,
+            center_crop_hw=cfg.get("center_crop_hw"),
+            normalize_events_nonzero=cfg.get("normalize_events_nonzero", False),
         )
         for scene_path, entries, wnd in windows
     ]

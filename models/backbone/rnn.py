@@ -93,6 +93,49 @@ class DWSConvLSTM2d(nn.Module):
         return h_t, c_t
 
 
+class StandardConvLSTM2d(nn.Module):
+    """Standard ConvLSTM: single 3x3 conv on concat(x, h) -> 4*dim gates (i, f, o, cell)."""
+
+    def __init__(
+        self,
+        dim: int,
+        cell_update_dropout: float = 0.,
+        T_max_chrono_init: Optional[int] = None,
+    ):
+        super().__init__()
+        self.dim = dim
+        xh_dim = dim * 2
+        gates_dim = dim * 4
+        self.gate_conv = nn.Conv2d(
+            in_channels=xh_dim,
+            out_channels=gates_dim,
+            kernel_size=3,
+            padding=1,
+            bias=True,
+        )
+        self.cell_update_dropout = nn.Dropout(p=cell_update_dropout)
+        if T_max_chrono_init is not None and self.gate_conv.bias is not None:
+            _chrono_ifg_bias(self.gate_conv.bias, dim, T_max_chrono_init, coupled=True)
+
+    def forward(self, x: th.Tensor, h_and_c_previous: Optional[Tuple[th.Tensor, th.Tensor]] = None):
+        if h_and_c_previous is None:
+            h_tm1 = th.zeros_like(x)
+            c_tm1 = th.zeros_like(x)
+        else:
+            h_tm1, c_tm1 = h_and_c_previous
+
+        xh = th.cat((x, h_tm1), dim=1)
+        mix = self.gate_conv(xh)
+        i_gate, forget_gate, output_gate, cell_input = th.tensor_split(mix, 4, dim=1)
+        input_gate = th.sigmoid(i_gate)
+        forget_gate = th.sigmoid(forget_gate)
+        output_gate = th.sigmoid(output_gate)
+        cell_input = self.cell_update_dropout(th.tanh(cell_input))
+        c_t = forget_gate * c_tm1 + input_gate * cell_input
+        h_t = output_gate * th.tanh(c_t)
+        return h_t, c_t
+
+
 class DWSConvSTLSTM2d(nn.Module):
     """Spatiotemporal LSTM (ST-LSTM) from PredRNN with optional depthwise-separable Conv.
 

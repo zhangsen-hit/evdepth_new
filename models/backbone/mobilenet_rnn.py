@@ -14,7 +14,12 @@ except ImportError:
     th_compile = None
 
 from data.utils.types import FeatureMap, BackboneFeatures, LstmState, LstmStates
-from models.backbone.rnn import DWSConvLSTM2d, DWSConvSTLSTM2d, _gn_num_groups
+from models.backbone.rnn import (
+    DWSConvLSTM2d,
+    DWSConvSTLSTM2d,
+    StandardConvLSTM2d,
+    _gn_num_groups,
+)
 from models.backbone.base import BaseDetector
 
 
@@ -114,10 +119,20 @@ class MobileNetRNNStage(nn.Module):
             cell_kwargs['dws_on_spatial_m'] = lstm_cfg.get('dws_on_spatial_m', True)
             cell_kwargs['use_group_norm'] = lstm_cfg.get('use_group_norm', True)
             self.lstm = DWSConvSTLSTM2d(**cell_kwargs)
-        elif cell_type == 'convlstm':
+        elif cell_type in ('convlstm', 'dws_convlstm'):
             self.lstm = DWSConvLSTM2d(**cell_kwargs)
+        elif cell_type == 'stand_convlstm':
+            stand_kwargs = dict(
+                dim=stage_dim,
+                cell_update_dropout=lstm_cfg.get('drop_cell_update', 0),
+                T_max_chrono_init=T_max_chrono_init,
+            )
+            self.lstm = StandardConvLSTM2d(**stand_kwargs)
         else:
-            raise ValueError(f"Unknown cell_type: {cell_type!r}, expected 'convlstm' or 'stlstm'")
+            raise ValueError(
+                f"Unknown cell_type: {cell_type!r}; expected "
+                f"'stlstm','convlstm','dws_convlstm','stand_convlstm'"
+            )
 
         # Mask token for token masking (if enabled)
         self.mask_token = nn.Parameter(

@@ -1,6 +1,7 @@
 from typing import Dict, Any
 
 from .mobilenet_rnn import MobileNetRNN
+from .e2depth_unet import E2DepthConvLSTMUNet
 from .base import BaseDetector
 
 
@@ -12,10 +13,12 @@ def build_recurrent_backbone(backbone_cfg: Dict[str, Any]):
     name = backbone_cfg["name"]
     if name == "MobileNetRNN":
         return MobileNetRNN(backbone_cfg)
+    if name == "E2DepthConvLSTMUNet":
+        return E2DepthConvLSTMUNet(backbone_cfg)
     raise NotImplementedError(
-        f"Backbone '{name}' not implemented. Only 'MobileNetRNN' is available."
+        f"Backbone '{name}' not implemented. Expected 'MobileNetRNN' or 'E2DepthConvLSTMUNet'."
     )
 
 
-__all__ = ["MobileNetRNN", "BaseDetector", "build_recurrent_backbone"]
+__all__ = ["MobileNetRNN", "E2DepthConvLSTMUNet", "BaseDetector", "build_recurrent_backbone"]
 

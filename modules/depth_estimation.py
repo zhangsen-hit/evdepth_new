@@ -23,10 +23,29 @@ from models.depth_head.depth_estimator import DepthEstimator
 
 
 def _finest_depth_pred(predictions: Dict[str, th.Tensor]) -> th.Tensor:
-    """有全分辨率头时用 depth_1，否则为 depth_2。"""
+    """取最高分辨率预测：优先 depth_1，否则 depth_2；不可对 .get 传入 predictions[\"depth_2\"] 作默认值（会先求值）。"""
     if predictions is None:
         raise TypeError("predictions must not be None")
-    return predictions.get("depth_1", predictions["depth_2"])
+    if "depth_1" in predictions:
+        return predictions["depth_1"]
+    if "depth_2" in predictions:
+        return predictions["depth_2"]
+    finest_k = None
+    finest_scale: Optional[int] = None
+    for k in predictions:
+        if isinstance(k, str) and k.startswith("depth_"):
+            suf = k[len("depth_") :]
+            if suf.isdigit():
+                s = int(suf)
+                if finest_scale is None or s < finest_scale:
+                    finest_scale = s
+                    finest_k = k
+    if finest_k is None:
+        raise KeyError(
+            "predictions 需含 depth_1、depth_2 或任一 depth_<scale>；"
+            f"当前 keys={tuple(predictions.keys())}"
+        )
+    return predictions[finest_k]
 
 
 class DepthOutput:

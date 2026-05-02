@@ -7,12 +7,129 @@ Includes SILog (Scale-Invariant Log) and image gradient loss
 - 本文件会在 loss 计算之前，把 `pred` 和 `target` 都转换到
   “归一化 log(depth)（min_depth=0.5, max_depth=80）”空间，再计算误差。
 """
-from typing import Optional
+from typing import Optional, List
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+
+
+class ScaleInvariantMaskedLoss(nn.Module):
+    """
+    SI loss in normalized log domain: inputs are already in norm_log space;
+    masked mean/var over valid pixels only.
+    """
+
+    def __init__(self, weight: float = 1.0, n_lambda: float = 1.0):
+        super().__init__()
+        self.weight = float(weight)
+        self.n_lambda = float(n_lambda)
+
+    def forward(
+        self,
+        pred: torch.Tensor,
+        target: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        diff = pred - target
+        if mask is None:
+            valid = torch.isfinite(diff.flatten())
+            d = diff.flatten()[valid]
+        else:
+            m = mask
+            if m.dtype != torch.bool:
+                m = m.bool()
+            if m.shape != pred.shape:
+                raise ValueError(f"mask shape {m.shape} != pred shape {pred.shape}")
+            finite = torch.isfinite(diff)
+            mv = (m & finite).flatten()
+            d = diff.flatten()[mv]
+
+        if d.numel() == 0:
+            return pred.new_zeros(())
+
+        mse = (d ** 2).mean()
+        mean_d = d.mean()
+        return self.weight * (mse - self.n_lambda * (mean_d ** 2))
+
+
+class E2DepthMultiScaleGradientLoss(nn.Module):
+    """E2Depth-style multi-scale gradients on pooled residual (no kornia)."""
+
+    def __init__(self, start_scale: int = 1, num_scales: int = 4):
+        super().__init__()
+        self.num_scales = int(num_scales)
+        ks = []
+        base = max(1, int(start_scale))
+        for s in range(self.num_scales):
+            k = base * (2 ** s)
+            ks.append(nn.AvgPool2d(kernel_size=k, stride=k))
+        self.multi_scales = nn.ModuleList(ks)
+
+        gx = torch.tensor(
+            [[-1.0, 0.0, 1.0], [-2.0, 0.0, 2.0], [-1.0, 0.0, 1.0]], dtype=torch.float32
+        ).view(1, 1, 3, 3)
+        gy = torch.tensor(
+            [[-1.0, -2.0, -1.0], [0.0, 0.0, 0.0], [1.0, 2.0, 1.0]], dtype=torch.float32
+        ).view(1, 1, 3, 3)
+        self.register_buffer("sobel_x", gx)
+        self.register_buffer("sobel_y", gy)
+
+    def _spatial_gradient(self, diff: torch.Tensor) -> torch.Tensor:
+        """Sobel on each channel -> (B, C, 2, H, W)."""
+        b, c, h, w = diff.shape
+        x = diff.reshape(b * c, 1, h, w).to(dtype=torch.float32)
+        kx = self.sobel_x.to(device=x.device, dtype=x.dtype)
+        ky = self.sobel_y.to(device=x.device, dtype=x.dtype)
+        gx = F.conv2d(x, kx, padding=1).view(b, c, h, w)
+        gy = F.conv2d(x, ky, padding=1).view(b, c, h, w)
+        return torch.stack((gx, gy), dim=2)
+
+    def forward(
+        self,
+        prediction: torch.Tensor,
+        target: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        diff = prediction - target
+        diff = torch.nan_to_num(diff, nan=0.0, posinf=0.0, neginf=0.0)
+        if mask is not None:
+            md = mask if mask.dtype == torch.bool else mask.bool()
+            diff = torch.where(md, diff, torch.zeros_like(diff))
+
+        loss_value = diff.new_zeros(())
+        device_type = prediction.device.type
+        autocast_on = torch.is_autocast_enabled() if device_type == "cuda" else False
+
+        for m_pool in self.multi_scales:
+            pd = diff
+            ksz = getattr(m_pool, "kernel_size", None)
+            if ksz is not None:
+                k0 = int(ksz) if isinstance(ksz, int) else int(ksz[0])
+            else:
+                k0 = 1
+            pd_min = min(pd.shape[-2], pd.shape[-1])
+            if pd_min < k0:
+                continue
+            if autocast_on:
+                with torch.amp.autocast(device_type=device_type, enabled=False):
+                    d_s = m_pool(pd.float()).to(dtype=diff.dtype)
+            else:
+                d_s = m_pool(pd.float()).to(dtype=diff.dtype)
+
+            if d_s.shape[-1] < 2 or d_s.shape[-2] < 2:
+                continue
+
+            if autocast_on:
+                with torch.amp.autocast(device_type=device_type, enabled=False):
+                    delta_diff = self._spatial_gradient(d_s.float())
+            else:
+                delta_diff = self._spatial_gradient(d_s.float())
+
+            loss_value = loss_value + delta_diff.abs().mean(dim=(3, 4)).sum().to(loss_value.dtype)
+
+        return loss_value / max(float(self.num_scales), 1.0)
 
 
 class BerHuLoss(nn.Module):
@@ -62,7 +179,7 @@ class SILogLoss(nn.Module):
     其中 t_i 为 target 在 norm_log 空间的值（∈[0,1]）。
     alpha=0 时严格等价于未加权版本。权重只依赖 target，且会 detach，不参与反传。
     """
-    def __init__(self, lambd: float = 0.5, far_weight_alpha: float = 0.0, far_weight_t0: float = 0.3):
+    def __init__(self, lambd: float = 1.0, far_weight_alpha: float = 0.0, far_weight_t0: float = 0.3):
         super().__init__()
         self.lambd = lambd
         self.far_weight_alpha = float(far_weight_alpha)
@@ -248,15 +365,19 @@ def event_edge_weight(event_repr: torch.Tensor, sigma: float = 3.0) -> torch.Ten
 
 class DepthLoss(nn.Module):
     """
-    Combined multi-scale depth loss
-    Combines SILog and gradient losses at multiple scales
+    Combined depth loss.
+
+    composition == "full": multi-resolution SILog + masked multi-scale gradients + extras.
+    composition == "sigrad_only": masked scale-invariant (norm_log) + E2Depth multi-scale Sobel(grad).
     """
+
     def __init__(
         self,
+        composition: str = "full",
         silog_weight: float = 1.0,
-        grad_weight: float = 0.5,
-        silog_lambda: float = 0.5,
-        scales: list = [1, 2, 4, 8, 16],  # Multi-scale outputs
+        grad_weight: float = 0.25,
+        silog_lambda: float = 1.0,
+        scales: Optional[List[int]] = None,
         depth_min: float = 0.5,
         depth_max: float = 80.0,
         far_weight_alpha: float = 0.0,
@@ -265,15 +386,13 @@ class DepthLoss(nn.Module):
         event_edge_sigma: float = 3.0,
         event_edge_grad_ratio: float = 0.5,
         scale1_weight_mul: float = 1.0,
+        si_weight: float = 1.0,
+        si_lambda: float = 1.0,
+        grad_start_scale: int = 1,
+        grad_num_scales: int = 4,
     ):
         super().__init__()
-        self.silog_weight = silog_weight
-        self.grad_weight = grad_weight
-        self.scales = scales
-        self.lap_weight = float(lap_weight)
-        self.event_edge_sigma = float(event_edge_sigma)
-        self.event_edge_grad_ratio = float(event_edge_grad_ratio)
-        self.scale1_weight_mul = float(scale1_weight_mul)
+        self.composition = composition
         self.depth_min = float(depth_min)
         self.depth_max = float(depth_max)
 
@@ -282,20 +401,44 @@ class DepthLoss(nn.Module):
         if self.depth_min >= self.depth_max:
             raise ValueError(f"depth_min must be < depth_max, got {depth_min=} {depth_max=}")
 
-        # Precompute constants for log(depth)->norm log(depth) transform
         self._log_depth_min = math.log(self.depth_min)
         self._log_depth_max = math.log(self.depth_max)
-        self._log_depth_denom = self._log_depth_max - self._log_depth_min  # > 0
+        self._log_depth_denom = self._log_depth_max - self._log_depth_min
 
-        self.silog_loss = SILogLoss(
-            lambd=silog_lambda,
-            far_weight_alpha=far_weight_alpha,
-            far_weight_t0=far_weight_t0,
-        )
-        # E2Depth 风格：gradient loss 只作用在最终（最高分辨率）预测的 residual 上，
-        # 并在 residual 的多个下采样尺度上累计（默认 4 个尺度）。
-        self.grad_loss = MultiScaleGradientLoss(num_scales=4)
-        self.lap_loss = LaplacianLoss()
+        if composition == "sigrad_only":
+            self.si_loss = ScaleInvariantMaskedLoss(weight=si_weight, n_lambda=si_lambda)
+            self.ms_grad_e2 = E2DepthMultiScaleGradientLoss(
+                start_scale=grad_start_scale, num_scales=grad_num_scales
+            )
+            self.grad_weight = float(grad_weight)
+            self.silog_loss = None
+            self.grad_loss = None
+            self.lap_loss = None
+            self.scales = []
+            self.silog_weight = 0.0
+            self.lap_weight = 0.0
+            self.event_edge_grad_ratio = 0.0
+            self.scale1_weight_mul = 1.0
+            self.event_edge_sigma = float(event_edge_sigma)
+        else:
+            if scales is None:
+                scales = [1, 2, 4, 8, 16]
+            self.silog_weight = silog_weight
+            self.grad_weight = grad_weight
+            self.scales = scales
+            self.lap_weight = float(lap_weight)
+            self.event_edge_sigma = float(event_edge_sigma)
+            self.event_edge_grad_ratio = float(event_edge_grad_ratio)
+            self.scale1_weight_mul = float(scale1_weight_mul)
+            self.silog_loss = SILogLoss(
+                lambd=silog_lambda,
+                far_weight_alpha=far_weight_alpha,
+                far_weight_t0=far_weight_t0,
+            )
+            self.grad_loss = MultiScaleGradientLoss(num_scales=4)
+            self.lap_loss = LaplacianLoss()
+            self.si_loss = None
+            self.ms_grad_e2 = None
 
     def log_depth_to_norm_log_depth(self, log_depth: torch.Tensor) -> torch.Tensor:
         """
@@ -420,6 +563,42 @@ class DepthLoss(nn.Module):
         
     #     return total_loss, losses_dict
 
+    def _forward_sigrad_only(
+        self,
+        predictions,
+        target: torch.Tensor,
+        mask,
+        event_repr: Optional[torch.Tensor],
+    ):
+        _ = event_repr
+        finest_key = "depth_1"
+        if finest_key not in predictions:
+            raise KeyError(
+                f"sigrad_only requires '{finest_key}' in predictions, keys={tuple(predictions.keys())}"
+            )
+        pred_final = predictions[finest_key]
+        target_hw = target.shape[-2:]
+        if pred_final.shape[-2:] != target_hw:
+            pred_final = F.interpolate(
+                pred_final, size=target_hw, mode="bilinear", align_corners=False
+            )
+        pred_final_norm_log = torch.clamp(pred_final, 0.0, 1.0)
+        target_norm_log = torch.clamp(target, 0.0, 1.0)
+        m = mask
+        if m is not None and m.dtype != torch.bool:
+            m = m.bool()
+
+        si = self.si_loss(pred_final_norm_log, target_norm_log, m)
+        assert self.ms_grad_e2 is not None
+        g_e2 = self.ms_grad_e2(pred_final_norm_log, target_norm_log, m)
+        total_loss = si + self.grad_weight * g_e2
+        losses_dict = {
+            "si_masked": si.detach(),
+            "grad_e2_multiscale": g_e2.detach(),
+            "loss": total_loss,
+        }
+        return total_loss, losses_dict
+
     def forward(
         self,
         predictions,
@@ -427,24 +606,9 @@ class DepthLoss(nn.Module):
         mask=None,
         event_repr: Optional[torch.Tensor] = None,
     ):
-        """
-        多尺度深度 loss（方案 A：masked avg pool 下采样稀疏 GT / mask）。
-
-        设计要点：
-        1) 每个 decoder 输出头的 SILog 主损失，在**该头自己的分辨率**上计算。
-           GT 与 mask 通过 *masked average pooling* 下采样到对应分辨率：
-           - 对 `target * mask` 和 `mask` 分别做 adaptive_avg_pool2d，
-             再用前者除以后者，得到"块内仅对有效像素求均值"的下采样 target；
-           - 新 mask 取 "块内至少一个有效像素"，避免无效区随下采样扩散。
-           这样做的好处：
-             - 稀疏 LiDAR 点不会因下采样而完全丢失（只要块内有 1 点就保留）；
-             - 低分辨率头只被要求匹配"局部平均深度"，与其表达能力相匹配，
-               不会像 "pred 上采样 → 与 /1 稀疏 GT 对齐" 那样被迫学邻域均值
-               从而通过 decoder 反向污染高分辨率头，导致输出整体偏糊。
-        2) E2Depth 多尺度 gradient loss：对**最精细**预测（有 depth_1 则用全分辨率，否则
-           depth_2 双线性上采样到 /1）与 /1 的 GT 算 residual 的多尺度梯度项。
-        3) 可选：Laplacian 项在 scale 1/2 与事件边缘加权的额外交叉梯度项（仅训练期）。
-        """
+        if self.composition == "sigrad_only":
+            return self._forward_sigrad_only(predictions, target, mask, event_repr)
+        # composition == "full": multi-scale SILog + MultiScaleGradientLoss + optional lap/event edge
         total_loss = torch.zeros((), device=target.device, dtype=target.dtype)
         losses_dict = {}
 
