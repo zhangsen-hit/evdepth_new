@@ -390,6 +390,8 @@ class DepthLoss(nn.Module):
         si_lambda: float = 1.0,
         grad_start_scale: int = 1,
         grad_num_scales: int = 4,
+        berhu_weight: float = 0.0,
+        berhu_threshold: float = 0.2,
     ):
         super().__init__()
         self.composition = composition
@@ -411,6 +413,13 @@ class DepthLoss(nn.Module):
                 start_scale=grad_start_scale, num_scales=grad_num_scales
             )
             self.grad_weight = float(grad_weight)
+            # Berhu 绝对锚定项：SI(λ<1) 已部分约束尺度，再加一项 Berhu 直接监督
+            # norm_log 空间的绝对值，彻底消除 scale-invariant 损失带来的全局漂移。
+            self.berhu_weight = float(berhu_weight)
+            if self.berhu_weight > 0.0:
+                self.berhu_loss = BerHuLoss(threshold=float(berhu_threshold))
+            else:
+                self.berhu_loss = None
             self.silog_loss = None
             self.grad_loss = None
             self.lap_loss = None
@@ -439,6 +448,8 @@ class DepthLoss(nn.Module):
             self.lap_loss = LaplacianLoss()
             self.si_loss = None
             self.ms_grad_e2 = None
+            self.berhu_loss = None
+            self.berhu_weight = 0.0
 
     def log_depth_to_norm_log_depth(self, log_depth: torch.Tensor) -> torch.Tensor:
         """
@@ -595,8 +606,12 @@ class DepthLoss(nn.Module):
         losses_dict = {
             "si_masked": si.detach(),
             "grad_e2_multiscale": g_e2.detach(),
-            "loss": total_loss,
         }
+        if self.berhu_loss is not None and self.berhu_weight > 0.0:
+            berhu = self.berhu_loss(pred_final_norm_log, target_norm_log, m)
+            total_loss = total_loss + self.berhu_weight * berhu
+            losses_dict["berhu_anchor"] = berhu.detach()
+        losses_dict["loss"] = total_loss
         return total_loss, losses_dict
 
     def forward(

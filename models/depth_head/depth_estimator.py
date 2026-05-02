@@ -79,6 +79,8 @@ class DepthEstimator(th.nn.Module):
                 grad_weight=float(loss_cfg.get("grad_weight", 0.25)),
                 grad_start_scale=int(loss_cfg.get("grad_start_scale", 1)),
                 grad_num_scales=int(loss_cfg.get("grad_num_scales", 4)),
+                berhu_weight=float(loss_cfg.get("berhu_weight", 0.0)),
+                berhu_threshold=float(loss_cfg.get("berhu_threshold", 0.2)),
             )
         else:
             self.loss_fn = DepthLoss(

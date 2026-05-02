@@ -1,1 +1,0 @@
-采用Claude 网页版的建议，直接修改了loss（拉普拉斯损失、事件边缘加权损失、bn->gn）、加了全分辨率深度头（DW+pixlshuffle）

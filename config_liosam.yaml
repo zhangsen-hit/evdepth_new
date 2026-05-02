@@ -111,13 +111,33 @@ model:
       dws_conv_only_hidden: true
       dws_conv_kernel_size: 3
       drop_cell_update: 0.0
+    # 注：以下 composition / si_* / grad_* 字段历史上写在 backbone 下其实不会被读取，
+    # 实际生效的是下面 model.loss 段。这里保留仅作可读性参考。
     composition: sigrad_only
     si_weight: 1.0
-    si_lambda: 1.0
+    si_lambda: 0.5
     grad_weight: 0.25
     grad_start_scale: 1
     grad_num_scales: 4
-  
+
+  # ----------------------------------------------------------------------------
+  # 损失函数配置（depth_estimator.py 真正读取的位置）
+  # sigrad_only = ScaleInvariantMaskedLoss + E2DepthMultiScaleGradientLoss [+ Berhu]
+  # 修改记录：
+  #   - si_lambda 1.0 -> 0.5：从完全尺度不变改为部分尺度不变，约束绝对尺度
+  #   - 新增 Berhu 锚定项 weight=0.2：在 norm_log 空间做 L1-like 监督，
+  #     彻底消除 SI/grad 损失对常数偏移不敏感导致的 delta1 漂移
+  # ----------------------------------------------------------------------------
+  loss:
+    composition: sigrad_only
+    si_weight: 1.0
+    si_lambda: 0.5
+    grad_weight: 0.25
+    grad_start_scale: 1
+    grad_num_scales: 4
+    berhu_weight: 0.2
+    berhu_threshold: 0.2
+
   depth_range:
     min: 0.5
     max: 80.0
