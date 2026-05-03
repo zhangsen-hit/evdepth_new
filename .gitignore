@@ -139,3 +139,4 @@ depth_epoch_viz_train/
 debug_depth/
 check_input/
 test_viz
+test_results/
