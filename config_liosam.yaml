@@ -14,7 +14,7 @@ dataset:
   path: /home/zs/Research3/dataset/
   
   # 序列长度（可调）。12GB 显存建议 24；显存充足可改为 50 或 200
-  sequence_length: 6
+  sequence_length: 40
   
   # 时间连续性：正常间隔约 5ms，允许 3ms 以内偏差 → [2ms, 8ms]
   frame_interval_sec: 0.005
@@ -33,6 +33,9 @@ dataset:
   # 中心裁剪后分辨率（与 model.backbone.in_res_hw 一致，H/W 可被 8 整除）
   resolution_hw: [256, 344]
   center_crop_hw: [256, 344]
+  # patch crop（参考 rpg_e2depth）：训练随机 crop、验证中心 crop，112 可被 8/4 整除
+  # 同一序列内的所有帧共享同一 (y0, x0) 与翻转选择
+  patch_crop_hw: [256, 344]
   normalize_events_nonzero: true
 
   downsample_by_factor_2: False
@@ -60,7 +63,7 @@ dataset:
   
   data_augmentation:
     random:
-      prob_hflip: 0.5
+      prob_hflip: 0.5 # 实际生效的水平翻转
       rotate:
         prob: 0.2
         min_angle_deg: 2
@@ -78,7 +81,8 @@ dataset:
             min: 1
             max: 1.15
     stream:
-      prob_hflip: 0.5
+      # h-flip 由 patch crop augmentor 处理（在序列加载层应用），此处置 0 以免双重翻转
+      prob_hflip: 0.0
       rotate:
         prob: 0.1
         min_angle_deg: 2
@@ -99,7 +103,9 @@ model:
   backbone:
     name: E2DepthConvLSTMUNet
     input_channels: 2
-    # 与 dataset.center_crop_hw / resolution_hw 一致，供 InputPadderFromShape
+    # 与训练/验证实际进入网络的 patch 尺寸一致（dataset.patch_crop_hw）
+    # 注意：测试/推理脚本 (run_depth.py / test.py) 仍按 center_crop_hw=[256,344] 输入，
+    # 若仍想对全分辨率推理，请把 in_res_hw 改回 [256, 344]，模型为全卷积无需重训。
     in_res_hw: [256, 344]
     use_batchnorm: false
     # stand_convlstm: 标准 3×3 门控卷积；dws_convlstm: 可分离卷积版（同 rnn.DWSConvLSTM2d）

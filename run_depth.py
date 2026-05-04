@@ -186,8 +186,13 @@ def main():
     with open(args.config, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
+    # 推理覆写：训练用 patch_crop_hw=[112,112] 配套的 in_res_hw=[112,112]，
+    # 但推理输入仍为 center_crop_hw=[256,344]。网络全卷积，权重直接复用，
+    # 只需把 input_padder 的目标尺寸改大到能容纳 256x344。
     ds_cfg = config["dataset"]
     center_crop_hw = tuple(int(v) for v in ds_cfg["center_crop_hw"])
+    config["model"]["backbone"]["in_res_hw"] = list(center_crop_hw)
+    print(f"[INFO] 推理覆写 in_res_hw -> {center_crop_hw}")
     normalize_events = bool(ds_cfg.get("normalize_events_nonzero", False))
     ev_key = ds_cfg.get("ev_key", DEFAULT_EV_KEY)
     depth_key = ds_cfg.get("depth_key", DEFAULT_DEPTH_KEY)

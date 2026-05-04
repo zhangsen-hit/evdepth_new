@@ -14,6 +14,7 @@ import torch
 from torch.utils.data import Dataset
 
 from data.genx_utils.labels import SparselyBatchedObjectLabels
+from data.utils.augmentor import SpatialAugmentorPatchCrop
 from data.utils.types import DataType, LoaderDataDictGenX
 
 
@@ -191,6 +192,7 @@ class LiosamSequenceForIter(Dataset):
         convert_depth_to_log: bool = True,
         center_crop_hw: Optional[Tuple[int, int]] = None,
         normalize_events_nonzero: bool = False,
+        augmentor: Optional[SpatialAugmentorPatchCrop] = None,
     ):
         self.path = path
         self.frame_indices = frame_indices  # indices into entries for this sequence
@@ -206,6 +208,7 @@ class LiosamSequenceForIter(Dataset):
             tuple(int(x) for x in center_crop_hw) if center_crop_hw is not None else None
         )
         self.normalize_events_nonzero = bool(normalize_events_nonzero)
+        self.augmentor = augmentor
         self._padding_representation = None
         assert len(frame_indices) == sequence_length
 
@@ -221,6 +224,9 @@ class LiosamSequenceForIter(Dataset):
             if self.center_crop_hw is not None:
                 ch, cw = self.center_crop_hw
                 t = center_crop_tensor_2d(t, ch, cw)
+            if self.augmentor is not None:
+                # 用 augmentor 的输出尺寸（中心裁剪即可，padding 仅看形状）
+                t = center_crop_tensor_2d(t, self.augmentor.crop_h, self.augmentor.crop_w)
             self._padding_representation = t
         return self._padding_representation
 
@@ -283,7 +289,7 @@ class LiosamSequenceForIter(Dataset):
         sparse_labels = SparselyBatchedObjectLabels(
             sparse_object_labels_batch=[None] * self.seq_len
         )
-        return {
+        out = {
             DataType.EV_REPR: ev_repr,
             DataType.OBJLABELS_SEQ: sparse_labels,
             DataType.IS_FIRST_SAMPLE: True,
@@ -291,6 +297,9 @@ class LiosamSequenceForIter(Dataset):
             DataType.DEPTH: depths,
             DataType.DEPTH_MASK: masks,
         }
+        if self.augmentor is not None:
+            out = self.augmentor(out)
+        return out
 
 
 class LiosamSequenceForRandomAccess:
@@ -312,6 +321,7 @@ class LiosamSequenceForRandomAccess:
         convert_depth_to_log: bool = True,
         center_crop_hw: Optional[Tuple[int, int]] = None,
         normalize_events_nonzero: bool = False,
+        augmentor: Optional[SpatialAugmentorPatchCrop] = None,
     ):
         self.path = path
         self.frame_indices = frame_indices
@@ -327,6 +337,7 @@ class LiosamSequenceForRandomAccess:
             tuple(int(x) for x in center_crop_hw) if center_crop_hw is not None else None
         )
         self.normalize_events_nonzero = bool(normalize_events_nonzero)
+        self.augmentor = augmentor
         self.length = 1
         self._only_load_labels = False
 
@@ -367,7 +378,7 @@ class LiosamSequenceForRandomAccess:
         sparse_labels = SparselyBatchedObjectLabels(
             sparse_object_labels_batch=[None] * self.seq_len
         )
-        return {
+        out = {
             DataType.EV_REPR: ev_repr,
             DataType.OBJLABELS_SEQ: sparse_labels,
             DataType.IS_FIRST_SAMPLE: True,
@@ -375,6 +386,9 @@ class LiosamSequenceForRandomAccess:
             DataType.DEPTH: depths,
             DataType.DEPTH_MASK: masks,
         }
+        if self.augmentor is not None:
+            out = self.augmentor(out)
+        return out
 
     def only_load_labels(self):
         self._only_load_labels = True
@@ -403,6 +417,30 @@ def _extract_common_config(dataset_config: Dict[str, Any]) -> Dict[str, Any]:
         max_depth=float(depth_range.get("max", 100.0)),
         center_crop_hw=chw,
         normalize_events_nonzero=bool(dataset_config.get("normalize_events_nonzero", False)),
+    )
+
+
+def _build_patch_crop_augmentor(
+    dataset_config: Dict[str, Any],
+    training: bool,
+) -> Optional[SpatialAugmentorPatchCrop]:
+    """根据配置构造 patch crop 增强器；未配置 patch_crop_hw 则返回 None。"""
+    crop_hw = dataset_config.get("patch_crop_hw", None)
+    if crop_hw is None:
+        return None
+    augm_cfg = dataset_config.get("data_augmentation", {})
+    h_flip_prob = 0.5
+    if isinstance(augm_cfg, dict):
+        # 训练时优先取 random 配置（liosam 当前用 random access），其次 stream
+        sub = augm_cfg.get("random") if training else None
+        if not isinstance(sub, dict):
+            sub = augm_cfg.get("stream") if isinstance(augm_cfg.get("stream"), dict) else {}
+        if isinstance(sub, dict):
+            h_flip_prob = float(sub.get("prob_hflip", 0.5))
+    return SpatialAugmentorPatchCrop(
+        crop_hw=tuple(int(x) for x in crop_hw),
+        training=training,
+        h_flip_prob=h_flip_prob,
     )
 
 
@@ -436,6 +474,7 @@ def _build_windows_for_scene(
 def _make_stream_list(
     windows: List[SceneWindow],
     cfg: Dict[str, Any],
+    augmentor: Optional[SpatialAugmentorPatchCrop] = None,
 ) -> List[LiosamSequenceForIter]:
     return [
         LiosamSequenceForIter(
@@ -451,6 +490,7 @@ def _make_stream_list(
             convert_depth_to_log=True,
             center_crop_hw=cfg.get("center_crop_hw"),
             normalize_events_nonzero=cfg.get("normalize_events_nonzero", False),
+            augmentor=augmentor,
         )
         for scene_path, entries, wnd in windows
     ]
@@ -459,6 +499,7 @@ def _make_stream_list(
 def _make_rnd_list(
     windows: List[SceneWindow],
     cfg: Dict[str, Any],
+    augmentor: Optional[SpatialAugmentorPatchCrop] = None,
 ) -> List[LiosamSequenceForRandomAccess]:
     return [
         LiosamSequenceForRandomAccess(
@@ -474,6 +515,7 @@ def _make_rnd_list(
             convert_depth_to_log=True,
             center_crop_hw=cfg.get("center_crop_hw"),
             normalize_events_nonzero=cfg.get("normalize_events_nonzero", False),
+            augmentor=augmentor,
         )
         for scene_path, entries, wnd in windows
     ]
@@ -535,10 +577,13 @@ def build_liosam_sequences(
     if not train_windows and not val_windows:
         return [], [], [], []
 
-    train_stream = _make_stream_list(train_windows, cfg)
-    val_stream = _make_stream_list(val_windows, cfg)
-    train_rnd = _make_rnd_list(train_windows, cfg)
-    val_rnd = _make_rnd_list(val_windows, cfg)
+    train_augm = _build_patch_crop_augmentor(dataset_config, training=True)
+    val_augm = _build_patch_crop_augmentor(dataset_config, training=False)
+
+    train_stream = _make_stream_list(train_windows, cfg, augmentor=train_augm)
+    val_stream = _make_stream_list(val_windows, cfg, augmentor=val_augm)
+    train_rnd = _make_rnd_list(train_windows, cfg, augmentor=train_augm)
+    val_rnd = _make_rnd_list(val_windows, cfg, augmentor=val_augm)
     return train_stream, val_stream, train_rnd, val_rnd
 
 

@@ -18,6 +18,63 @@ NO_LABEL_WARN_MSG = 'No Labels found. This can lead to a crash and should not ha
 filterwarnings('always', message=NO_LABEL_WARN_MSG)
 
 
+class SpatialAugmentorPatchCrop:
+    """序列级 patch 裁剪 + 水平翻转（参考 rpg_e2depth）。
+
+    训练：每次 __call__ 随机采样 (y0, x0) 与是否 h-flip；同一次调用对所有帧
+    使用相同的窗口与翻转，从而保证一个序列内时序一致。
+    验证/测试：固定中心裁剪，不翻转。
+
+    输入数据为 LoaderDataDictGenX，期望含 DataType.EV_REPR（List[Tensor (C,H,W)]），
+    可选 DataType.DEPTH / DataType.DEPTH_MASK（List[Tensor (1,H,W)]）。
+    """
+
+    def __init__(self,
+                 crop_hw: Tuple[int, int],
+                 training: bool,
+                 h_flip_prob: float = 0.5):
+        ch, cw = int(crop_hw[0]), int(crop_hw[1])
+        assert ch > 0 and cw > 0
+        self.crop_h = ch
+        self.crop_w = cw
+        self.training = bool(training)
+        self.h_flip_prob = float(h_flip_prob) if self.training else 0.0
+        assert 0.0 <= self.h_flip_prob <= 1.0
+
+    def _sample_window(self, in_h: int, in_w: int) -> Tuple[int, int, bool]:
+        assert in_h >= self.crop_h and in_w >= self.crop_w, \
+            f'input ({in_h}x{in_w}) smaller than crop ({self.crop_h}x{self.crop_w})'
+        if self.training:
+            y0 = int(th.randint(0, in_h - self.crop_h + 1, (1,)).item())
+            x0 = int(th.randint(0, in_w - self.crop_w + 1, (1,)).item())
+            do_flip = th.rand(1).item() < self.h_flip_prob
+        else:
+            y0 = (in_h - self.crop_h) // 2
+            x0 = (in_w - self.crop_w) // 2
+            do_flip = False
+        return y0, x0, do_flip
+
+    def _apply(self, t: th.Tensor, y0: int, x0: int, do_flip: bool) -> th.Tensor:
+        out = t[..., y0:y0 + self.crop_h, x0:x0 + self.crop_w]
+        if do_flip:
+            out = th.flip(out, dims=[-1])
+        return out
+
+    def __call__(self, item: LoaderDataDictGenX) -> LoaderDataDictGenX:
+        ev_list = item.get(DataType.EV_REPR, None)
+        if ev_list is None or len(ev_list) == 0:
+            return item
+        in_h, in_w = ev_list[0].shape[-2:]
+        y0, x0, do_flip = self._sample_window(int(in_h), int(in_w))
+
+        item[DataType.EV_REPR] = [self._apply(t, y0, x0, do_flip) for t in ev_list]
+        if DataType.DEPTH in item:
+            item[DataType.DEPTH] = [self._apply(t, y0, x0, do_flip) for t in item[DataType.DEPTH]]
+        if DataType.DEPTH_MASK in item:
+            item[DataType.DEPTH_MASK] = [self._apply(t, y0, x0, do_flip) for t in item[DataType.DEPTH_MASK]]
+        return item
+
+
 @dataclass
 class ZoomOutState:
     active: bool
