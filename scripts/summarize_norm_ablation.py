@@ -27,6 +27,9 @@ ENTRIES = [
     ("v9_rms_3k",           "v9 RMSNorm"),
     ("v10_in_3k",           "v10 InstanceNorm"),
     ("v11_in_m_only_no_s0_no_adapter_3k", "v11 IN+M-only+no_s0+no_ad"),
+    ("v12_full_lightweight_3k",           "v12 v11 + DSConv + IR(t=4)"),
+    ("v11b_chrono_fix_3k",                "v11b v11 + chrono fix"),
+    ("v13_fused_cell_3k",                 "v13 v11 + fused cell"),
 ]
 
 

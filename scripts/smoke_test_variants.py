@@ -40,10 +40,39 @@ VARIANTS = {
         "gn_stages": [False, True, True],
         "zigzag_adapter_norm": False,
     },
+    # v12 = v11 + DSConv encoder + DSConv decoder + IR(t=4) bottleneck.
+    "v12_full_lightweight": {
+        "norm_type": "in",
+        "norm_components": ["spatial", "memory"],
+        "gn_stages": [False, True, True],
+        "zigzag_adapter_norm": False,
+        "use_dsconv_encoder": True,
+        "use_dsconv_decoder": True,
+        "bottleneck_block": "ir",
+        "ir_expand_ratio": 4,
+    },
+    # v13 = v11 with the fused ST-LSTM cell.
+    "v13_fused_cell": {
+        "encoder_lstm_type": "fused_stlstm",
+        "norm_type": "in",
+        "norm_components": ["spatial", "memory"],
+        "gn_stages": [False, True, True],
+        "zigzag_adapter_norm": False,
+    },
 }
 
 
 def _build(extra: dict) -> E2DepthConvLSTMUNet:
+    # Allow `extra` to patch either encoder_lstm or top-level backbone fields:
+    # keys in TOP_LEVEL_KEYS go to mdl_config, others go to encoder_lstm.
+    TOP_LEVEL_KEYS = {
+        "encoder_lstm_type",
+        "use_dsconv_encoder", "use_dsconv_decoder",
+        "bottleneck_block", "ir_expand_ratio",
+    }
+    top_extra = {k: v for k, v in extra.items() if k in TOP_LEVEL_KEYS}
+    cell_extra = {k: v for k, v in extra.items() if k not in TOP_LEVEL_KEYS}
+
     cfg = {
         "input_channels": 2,
         "in_res_hw": [64, 80],
@@ -61,8 +90,9 @@ def _build(extra: dict) -> E2DepthConvLSTMUNet:
             "norm_type": "gn",
             "gn_stages": [True, True, True],
             "zigzag_adapter_norm": True,
-            **extra,
+            **cell_extra,
         },
+        **top_extra,
     }
     return E2DepthConvLSTMUNet(cfg)
 

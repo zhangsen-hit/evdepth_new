@@ -15,6 +15,7 @@ from models.backbone.base import BaseDetector
 from models.backbone.rnn import (
     DWSConvLSTM2d,
     DWSConvSTLSTM2d,
+    FusedDWSConvSTLSTM2d,
     StandardConvLSTM2d,
     _gn_num_groups,
 )
@@ -64,8 +65,22 @@ def _build_convlstm(
             norm_type=lstm_cfg.get("norm_type", "gn"),
             norm_components=lstm_cfg.get("norm_components", None),
         )
+    if t == "fused_stlstm":
+        use_gn = bool(lstm_cfg.get("use_group_norm", True)) and stage_use_norm
+        return FusedDWSConvSTLSTM2d(
+            dim=dim,
+            dws_conv=lstm_cfg.get("dws_conv", True),
+            dws_conv_only_hidden=lstm_cfg.get("dws_conv_only_hidden", True),
+            dws_conv_kernel_size=lstm_cfg.get("dws_conv_kernel_size", 5),
+            dws_on_spatial_m=lstm_cfg.get("dws_on_spatial_m", True),
+            cell_update_dropout=drop,
+            T_max_chrono_init=T_max_chrono_init,
+            use_group_norm=use_gn,
+            norm_type=lstm_cfg.get("norm_type", "gn"),
+            norm_components=lstm_cfg.get("norm_components", None),
+        )
     raise ValueError(
-        f"encoder_lstm_type must be 'stand_convlstm', 'dws_convlstm', or 'stlstm', got {t!r}"
+        f"encoder_lstm_type must be 'stand_convlstm', 'dws_convlstm', 'stlstm', or 'fused_stlstm', got {t!r}"
     )
 
 
@@ -107,6 +122,79 @@ class _ResidualBlock256(nn.Module):
         return self.act2(x + y)
 
 
+class _LayerNorm2d(nn.Module):
+    """Channel-wise LayerNorm for NCHW (ConvNeXt convention).
+
+    Permutes to NHWC, runs nn.LayerNorm over the channel dim per spatial
+    location, permutes back. Affine scale + bias.
+    """
+
+    def __init__(self, channels: int, eps: float = 1e-6):
+        super().__init__()
+        self.norm = nn.LayerNorm(channels, eps=eps)
+
+    def forward(self, x: th.Tensor) -> th.Tensor:
+        return self.norm(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+
+
+class _DSConv(nn.Module):
+    """Depthwise + pointwise replacement for `_Conv_relu`.
+
+    DW (k×k, stride=s, groups=in_ch) → LN → ReLU6 → PW (1×1, in_ch→out_ch) → LN → ReLU6
+    """
+
+    def __init__(self, in_ch: int, out_ch: int, kernel: int, stride: int, padding: int):
+        super().__init__()
+        self.dw = nn.Conv2d(
+            in_ch, in_ch, kernel_size=kernel, stride=stride,
+            padding=padding, groups=in_ch, bias=False,
+        )
+        self.norm1 = _LayerNorm2d(in_ch)
+        self.act1 = nn.ReLU6(inplace=True)
+        self.pw = nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False)
+        self.norm2 = _LayerNorm2d(out_ch)
+        self.act2 = nn.ReLU6(inplace=True)
+
+    def forward(self, x: th.Tensor) -> th.Tensor:
+        x = self.act1(self.norm1(self.dw(x)))
+        x = self.act2(self.norm2(self.pw(x)))
+        return x
+
+
+class _InvertedResidual(nn.Module):
+    """MobileNetV2-style inverted residual block with LN + ReLU6.
+
+    1×1 expand (C → t·C) → LN → ReLU6
+    3×3 dw   (groups=t·C) → LN → ReLU6
+    1×1 project (t·C → C) → LN              ← linear bottleneck (no activation)
+    + residual
+
+    For our bottleneck (256→256, stride=1) the residual is always active.
+    """
+
+    def __init__(self, channels: int, expand_ratio: int = 4):
+        super().__init__()
+        hidden = channels * expand_ratio
+        self.expand = nn.Conv2d(channels, hidden, kernel_size=1, bias=False)
+        self.norm1 = _LayerNorm2d(hidden)
+        self.act1 = nn.ReLU6(inplace=True)
+        self.dw = nn.Conv2d(
+            hidden, hidden, kernel_size=3, stride=1, padding=1,
+            groups=hidden, bias=False,
+        )
+        self.norm2 = _LayerNorm2d(hidden)
+        self.act2 = nn.ReLU6(inplace=True)
+        self.project = nn.Conv2d(hidden, channels, kernel_size=1, bias=False)
+        self.norm3 = _LayerNorm2d(channels)
+
+    def forward(self, x: th.Tensor) -> th.Tensor:
+        identity = x
+        y = self.act1(self.norm1(self.expand(x)))
+        y = self.act2(self.norm2(self.dw(y)))
+        y = self.norm3(self.project(y))
+        return identity + y
+
+
 class E2DepthConvLSTMUNet(BaseDetector):
     """
     LiOSAM / E2Depth-style U-Net with three encoder ConvLSTMs.
@@ -122,6 +210,17 @@ class E2DepthConvLSTMUNet(BaseDetector):
         self.in_channels = int(mdl_config["input_channels"])
         use_bn = bool(mdl_config.get("use_batchnorm", False))
         encoder_lstm_type = str(mdl_config.get("encoder_lstm_type", "stand_convlstm"))
+
+        # --- Lightweight block flags (IR + DSConv phase) ---
+        # Defaults preserve current architecture (regular convs + ResBlock256).
+        use_dsconv_encoder = bool(mdl_config.get("use_dsconv_encoder", False))
+        use_dsconv_decoder = bool(mdl_config.get("use_dsconv_decoder", False))
+        bottleneck_block = str(mdl_config.get("bottleneck_block", "residual"))
+        ir_expand_ratio = int(mdl_config.get("ir_expand_ratio", 4))
+        if bottleneck_block not in ("residual", "ir"):
+            raise ValueError(
+                f"bottleneck_block must be 'residual' or 'ir', got {bottleneck_block!r}"
+            )
 
         lstm_cfg = mdl_config.get("encoder_lstm", {}) or {}
         if not isinstance(lstm_cfg, dict):
@@ -151,17 +250,23 @@ class E2DepthConvLSTMUNet(BaseDetector):
         gn_stages = [bool(v) for v in gn_stages_cfg]
 
         # --- Encoders ---
-        self.enc_conv0 = _Conv_relu(32, 64, 5, 2, 2, use_bn)
+        def _enc(in_ch: int, out_ch: int) -> nn.Module:
+            if use_dsconv_encoder:
+                return _DSConv(in_ch, out_ch, kernel=5, stride=2, padding=2)
+            return _Conv_relu(in_ch, out_ch, 5, 2, 2, use_bn)
+
+        self.enc_conv0 = _enc(32, 64)
         self.lstm0 = _build_convlstm(encoder_lstm_type, 64, lstm_cfg, t_vals[0], stage_use_norm=gn_stages[0])
-        self.enc_conv1 = _Conv_relu(64, 128, 5, 2, 2, use_bn)
+        self.enc_conv1 = _enc(64, 128)
         self.lstm1 = _build_convlstm(encoder_lstm_type, 128, lstm_cfg, t_vals[1], stage_use_norm=gn_stages[1])
-        self.enc_conv2 = _Conv_relu(128, 256, 5, 2, 2, use_bn)
+        self.enc_conv2 = _enc(128, 256)
         self.lstm2 = _build_convlstm(encoder_lstm_type, 256, lstm_cfg, t_vals[2], stage_use_norm=gn_stages[2])
 
         # --- ST-LSTM zigzag wiring (PredRNN/PredRNN++ style) ---
         self.cell_type = encoder_lstm_type
         self.use_zigzag = (
-            encoder_lstm_type == "stlstm" and bool(lstm_cfg.get("zigzag", False))
+            encoder_lstm_type in ("stlstm", "fused_stlstm")
+            and bool(lstm_cfg.get("zigzag", False))
         )
         # Adapter-level GN switch (ablation 5). Controls only the zigzag adapter
         # GroupNorms — independent of cell-level GN.
@@ -205,12 +310,23 @@ class E2DepthConvLSTMUNet(BaseDetector):
             )
 
         # --- Bottleneck ---
-        self.bot_res = nn.Sequential(_ResidualBlock256(use_bn), _ResidualBlock256(use_bn))
+        if bottleneck_block == "ir":
+            self.bot_res = nn.Sequential(
+                _InvertedResidual(256, expand_ratio=ir_expand_ratio),
+                _InvertedResidual(256, expand_ratio=ir_expand_ratio),
+            )
+        else:
+            self.bot_res = nn.Sequential(_ResidualBlock256(use_bn), _ResidualBlock256(use_bn))
 
         # --- Decoders ---
-        self.dec0_conv = _Conv_relu(256, 128, 5, 1, 2, use_bn)
-        self.dec1_conv = _Conv_relu(128, 64, 5, 1, 2, use_bn)
-        self.dec2_conv = _Conv_relu(64, 32, 5, 1, 2, use_bn)
+        def _dec(in_ch: int, out_ch: int) -> nn.Module:
+            if use_dsconv_decoder:
+                return _DSConv(in_ch, out_ch, kernel=5, stride=1, padding=2)
+            return _Conv_relu(in_ch, out_ch, 5, 1, 2, use_bn)
+
+        self.dec0_conv = _dec(256, 128)
+        self.dec1_conv = _dec(128, 64)
+        self.dec2_conv = _dec(64, 32)
 
         self.pred_conv = nn.Conv2d(32, 1, kernel_size=1, stride=1, padding=0, bias=True)
 
@@ -268,7 +384,7 @@ class E2DepthConvLSTMUNet(BaseDetector):
             else (s2_tuple[0], s2_tuple[1])
         )
 
-        is_stlstm = self.cell_type == "stlstm"
+        is_stlstm = self.cell_type in ("stlstm", "fused_stlstm")
 
         if is_stlstm:
             # Determine M fed into stage 0 — from zigzag link or stage-0's own t-1 M.
