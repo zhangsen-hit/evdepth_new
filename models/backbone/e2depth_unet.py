@@ -29,7 +29,10 @@ def _build_convlstm(
     dim: int,
     lstm_cfg: Dict[str, Any],
     T_max_chrono_init: Optional[int],
+    stage_use_norm: bool = True,
 ) -> nn.Module:
+    """`stage_use_norm=False` forces this stage's ST-LSTM cell to skip all
+    norms (per-stage GN ablation), regardless of cell-level cfg."""
     t = encoder_lstm_type
     drop = lstm_cfg.get("drop_cell_update", 0)
     if t == "stand_convlstm":
@@ -48,6 +51,7 @@ def _build_convlstm(
             T_max_chrono_init=T_max_chrono_init,
         )
     if t == "stlstm":
+        use_gn = bool(lstm_cfg.get("use_group_norm", True)) and stage_use_norm
         return DWSConvSTLSTM2d(
             dim=dim,
             dws_conv=lstm_cfg.get("dws_conv", True),
@@ -56,7 +60,9 @@ def _build_convlstm(
             dws_on_spatial_m=lstm_cfg.get("dws_on_spatial_m", True),
             cell_update_dropout=drop,
             T_max_chrono_init=T_max_chrono_init,
-            use_group_norm=lstm_cfg.get("use_group_norm", True),
+            use_group_norm=use_gn,
+            norm_type=lstm_cfg.get("norm_type", "gn"),
+            norm_components=lstm_cfg.get("norm_components", None),
         )
     raise ValueError(
         f"encoder_lstm_type must be 'stand_convlstm', 'dws_convlstm', or 'stlstm', got {t!r}"
@@ -134,19 +140,36 @@ class E2DepthConvLSTMUNet(BaseDetector):
         self.head_bn = nn.BatchNorm2d(32) if use_bn else nn.Identity()
         self.head_relu = _relu_inplace()
 
+        # Per-stage GN override (ablation 3/4): default all True
+        gn_stages_cfg = lstm_cfg.get("gn_stages", [True, True, True])
+        if not (
+            isinstance(gn_stages_cfg, (list, tuple)) and len(gn_stages_cfg) == 3
+        ):
+            raise ValueError(
+                f"encoder_lstm.gn_stages must be a length-3 bool list, got {gn_stages_cfg!r}"
+            )
+        gn_stages = [bool(v) for v in gn_stages_cfg]
+
         # --- Encoders ---
         self.enc_conv0 = _Conv_relu(32, 64, 5, 2, 2, use_bn)
-        self.lstm0 = _build_convlstm(encoder_lstm_type, 64, lstm_cfg, t_vals[0])
+        self.lstm0 = _build_convlstm(encoder_lstm_type, 64, lstm_cfg, t_vals[0], stage_use_norm=gn_stages[0])
         self.enc_conv1 = _Conv_relu(64, 128, 5, 2, 2, use_bn)
-        self.lstm1 = _build_convlstm(encoder_lstm_type, 128, lstm_cfg, t_vals[1])
+        self.lstm1 = _build_convlstm(encoder_lstm_type, 128, lstm_cfg, t_vals[1], stage_use_norm=gn_stages[1])
         self.enc_conv2 = _Conv_relu(128, 256, 5, 2, 2, use_bn)
-        self.lstm2 = _build_convlstm(encoder_lstm_type, 256, lstm_cfg, t_vals[2])
+        self.lstm2 = _build_convlstm(encoder_lstm_type, 256, lstm_cfg, t_vals[2], stage_use_norm=gn_stages[2])
 
         # --- ST-LSTM zigzag wiring (PredRNN/PredRNN++ style) ---
         self.cell_type = encoder_lstm_type
         self.use_zigzag = (
             encoder_lstm_type == "stlstm" and bool(lstm_cfg.get("zigzag", False))
         )
+        # Adapter-level GN switch (ablation 5). Controls only the zigzag adapter
+        # GroupNorms — independent of cell-level GN.
+        adapter_use_norm = bool(lstm_cfg.get("zigzag_adapter_norm", True))
+
+        def _adapter_gn(c: int) -> nn.Module:
+            return nn.GroupNorm(_gn_num_groups(c), c) if adapter_use_norm else nn.Identity()
+
         self._encoder_dims = (64, 128, 256)
         if self.use_zigzag:
             d0, d1, d2 = self._encoder_dims
@@ -156,28 +179,27 @@ class E2DepthConvLSTMUNet(BaseDetector):
                     nn.Sequential(
                         nn.AvgPool2d(kernel_size=2, stride=2),
                         nn.Conv2d(d0, d1, kernel_size=1, bias=False),
-                        nn.GroupNorm(_gn_num_groups(d1), d1),
+                        _adapter_gn(d1),
                         nn.SiLU(inplace=True),
                     ),
                     nn.Sequential(
                         nn.AvgPool2d(kernel_size=2, stride=2),
                         nn.Conv2d(d1, d2, kernel_size=1, bias=False),
-                        nn.GroupNorm(_gn_num_groups(d2), d2),
+                        _adapter_gn(d2),
                         nn.SiLU(inplace=True),
                     ),
                 ]
             )
             # Zigzag: last stage (256, /8) at t-1 -> first stage (64, /2) at t
             # 1x1 project channels, then bilinear upsample (in forward), then 5x5 dws refine.
-            g0 = _gn_num_groups(d0)
             self.m_adapter_zigzag = nn.Sequential(
                 nn.Conv2d(d2, d0, kernel_size=1, bias=False),
-                nn.GroupNorm(g0, d0),
+                _adapter_gn(d0),
                 nn.SiLU(inplace=True),
             )
             self.m_adapter_zigzag_refine = nn.Sequential(
                 nn.Conv2d(d0, d0, kernel_size=5, padding=2, groups=d0, bias=False),
-                nn.GroupNorm(g0, d0),
+                _adapter_gn(d0),
                 nn.SiLU(inplace=True),
                 nn.Conv2d(d0, d0, kernel_size=1, bias=False),
             )

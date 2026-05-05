@@ -1,0 +1,6 @@
+E2DepthUNet: mean=7.55 ms, median=7.39 ms
+E2DepthUNet: mean=7.57 ms, median=7.38 ms
+E2DepthUNet: mean=7.58 ms, median=7.45 ms
+E2DepthUNet: mean=7.65 ms, median=7.51 ms
+E2DepthUNet: mean=7.75 ms, median=7.61 ms
+E2DepthUNet: mean=7.64 ms, median=7.45 ms

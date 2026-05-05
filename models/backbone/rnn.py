@@ -12,6 +12,26 @@ def _gn_num_groups(channels: int, preferred: int = 8) -> int:
     return max(g, 1)
 
 
+class RMSNorm2d(nn.Module):
+    """Channel-wise RMSNorm for NCHW tensors (PyTorch nn.RMSNorm semantics).
+
+    For each spatial location independently, normalizes across the channel dim
+    by the RMS (no mean subtraction). Affine scale only (no bias). Stats are
+    computed in float32 for fp16/bf16 stability, then cast back.
+    """
+
+    def __init__(self, channels: int, eps: float = 1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(th.ones(channels))
+        self.eps = eps
+
+    def forward(self, x: th.Tensor) -> th.Tensor:
+        x32 = x.float()
+        rms = x32.pow(2).mean(dim=1, keepdim=True).add(self.eps).rsqrt()
+        y = (x32 * rms).to(x.dtype)
+        return y * self.weight.view(1, -1, 1, 1)
+
+
 def _chrono_ifg_bias(bias: th.Tensor, dim: int, T_max: int, coupled: bool = True) -> None:
     """Chrono-style init for 3*dim IFG block: forget ~ log U(1,T), optional input = -forget."""
     if T_max is None or T_max < 2:
@@ -155,6 +175,9 @@ class DWSConvSTLSTM2d(nn.Module):
       - Chrono init on forget gates (uses T_max_chrono_init from config per stage)
     """
 
+    # Component names for selective normalization (4 of them).
+    NORM_COMPONENTS = ("temporal", "spatial", "output", "memory")
+
     def __init__(self,
                  dim: int,
                  dws_conv: bool = True,
@@ -163,13 +186,39 @@ class DWSConvSTLSTM2d(nn.Module):
                  dws_on_spatial_m: bool = True,
                  cell_update_dropout: float = 0.,
                  T_max_chrono_init: Optional[int] = None,
-                 use_group_norm: bool = True):
+                 use_group_norm: bool = True,
+                 norm_type: str = "gn",
+                 norm_components: Optional[Tuple[str, ...]] = None):
+        """
+        norm_type: 'gn' (default), 'ln' (= GroupNorm with num_groups=1, equivalent
+                   to LayerNorm over (C,H,W)), 'bn' (BatchNorm2d), or 'none'.
+        norm_components: subset of {'temporal','spatial','output','memory'} that
+                         get normalization. None = all four. [] = none.
+        use_group_norm: legacy switch. False overrides everything to 'none'.
+        """
         super().__init__()
         assert isinstance(dws_conv, bool)
         assert isinstance(dws_conv_only_hidden, bool)
         self.dim = dim
         self.T_max_chrono_init = T_max_chrono_init
-        self.use_group_norm = use_group_norm
+        # Normalize the legacy + new flags into a single (norm_type, components) pair.
+        if not use_group_norm:
+            norm_type = "none"
+            norm_components = ()
+        if norm_components is None:
+            norm_components = self.NORM_COMPONENTS
+        norm_components = tuple(norm_components)
+        for c in norm_components:
+            if c not in self.NORM_COMPONENTS:
+                raise ValueError(
+                    f"unknown norm component {c!r}; expected subset of {self.NORM_COMPONENTS}"
+                )
+        if norm_type not in ("gn", "ln", "bn", "rms", "in", "none"):
+            raise ValueError(
+                f"norm_type must be 'gn'|'ln'|'bn'|'rms'|'in'|'none', got {norm_type!r}"
+            )
+        self.norm_type = norm_type
+        self.norm_components = norm_components
 
         xh_dim = dim * 2
         t_ch = dim * 3
@@ -203,12 +252,11 @@ class DWSConvSTLSTM2d(nn.Module):
         # Combine C and M for hidden state: cat(C_t, M_t) -> dim
         self.conv1x1_memory = nn.Conv2d(in_channels=dim * 2, out_channels=dim, kernel_size=1)
 
-        g3 = _gn_num_groups(t_ch)
-        g_dim = _gn_num_groups(dim)
-        self.gn_temporal = nn.GroupNorm(g3, t_ch) if use_group_norm else nn.Identity()
-        self.gn_spatial = nn.GroupNorm(g3, t_ch) if use_group_norm else nn.Identity()
-        self.gn_output = nn.GroupNorm(g_dim, dim) if use_group_norm else nn.Identity()
-        self.gn_memory = nn.GroupNorm(g_dim, dim) if use_group_norm else nn.Identity()
+        # Build per-component norm modules; Identity when disabled or component missing.
+        self.gn_temporal = self._make_norm("temporal", t_ch)
+        self.gn_spatial = self._make_norm("spatial", t_ch)
+        self.gn_output = self._make_norm("output", dim)
+        self.gn_memory = self._make_norm("memory", dim)
 
         self.cell_update_dropout = nn.Dropout(p=cell_update_dropout)
 
@@ -218,6 +266,24 @@ class DWSConvSTLSTM2d(nn.Module):
                 _chrono_ifg_bias(self.conv1x1_temporal.bias, dim, T_max_chrono_init, coupled=True)
             if self.conv1x1_spatial.bias is not None:
                 _chrono_ifg_bias(self.conv1x1_spatial.bias, dim, T_max_chrono_init, coupled=True)
+
+    def _make_norm(self, component: str, channels: int) -> nn.Module:
+        """Build the norm module for a given component, honoring norm_type/components."""
+        if self.norm_type == "none" or component not in self.norm_components:
+            return nn.Identity()
+        if self.norm_type == "gn":
+            return nn.GroupNorm(_gn_num_groups(channels), channels)
+        if self.norm_type == "ln":
+            # GroupNorm with num_groups=1 == LayerNorm over (C,H,W) per sample.
+            return nn.GroupNorm(1, channels)
+        if self.norm_type == "bn":
+            return nn.BatchNorm2d(channels)
+        if self.norm_type == "rms":
+            # Channel-wise RMSNorm per spatial location (PyTorch nn.RMSNorm convention).
+            return RMSNorm2d(channels)
+        if self.norm_type == "in":
+            return nn.InstanceNorm2d(channels, affine=True)
+        raise ValueError(self.norm_type)
 
     def forward(self, x: th.Tensor,
                 h_and_c_previous: Optional[Tuple[th.Tensor, th.Tensor]] = None,
