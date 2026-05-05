@@ -110,18 +110,18 @@ model:
     use_batchnorm: false
     # stand_convlstm: 标准 3×3 门控卷积；dws_convlstm: 可分离卷积版；
     # stlstm: PredRNN 风格 ST-LSTM（双记忆 C+M），可配合 zigzag 跨层/跨时间步流动
-    encoder_lstm_type: stand_convlstm
+    encoder_lstm_type: stlstm
     # 与 MobileNet 阶段 chrono 类似，供各 encoder ConvLSTM 使用（可选）
     T_max_chrono_init_encoder: [4, 8, 16]
     encoder_lstm:
       dws_conv: true
       dws_conv_only_hidden: true
-      dws_conv_kernel_size: 3
+      dws_conv_kernel_size: 5
       drop_cell_update: 0.0
       # 仅在 encoder_lstm_type=stlstm 时生效
-      zigzag: false           # true 启用 last-stage(t-1) -> first-stage(t) zigzag 路由
+      zigzag: true            # true 启用 last-stage(t-1) -> first-stage(t) zigzag 路由
       dws_on_spatial_m: true  # 在 m_{t-1} 上也用 5x5 dws（PredRNN 风格）
-      use_group_norm: true    # ST-LSTM 内部 GroupNorm（bs=1 友好）
+      use_group_norm: false   # 速度消融：关闭 ST-LSTM 内部 GroupNorm
     # 注：以下 composition / si_* / grad_* 字段历史上写在 backbone 下其实不会被读取，
     # 实际生效的是下面 model.loss 段。这里保留仅作可读性参考。
     composition: sigrad_only
@@ -159,15 +159,16 @@ model:
 training:
   precision: "16-mixed"
   max_epochs: 1000
-  max_steps: 70000
+  # 短训验证：3000 step 足以判断 loss 是否下降、有无 NaN/梯度爆炸
+  max_steps: 3000
   learning_rate: 0.0005
   weight_decay: 0.005
   gradient_clip_val: 1.0
   limit_train_batches: 1.0
-  
+
   lr_scheduler:
     use: True
-    total_steps: 70000
+    total_steps: 3000
     pct_start: 0.2
     div_factor: 25
     final_div_factor: 10000
@@ -176,8 +177,10 @@ training:
 # 验证配置
 # ----------------------------------------------------------------------------
 validation:
-  limit_val_batches: 1.0
-  val_check_interval: null
+  # 短训：每 500 step 验证一次（int -> 按 step 计），并限制 val 只跑 5%
+  # 这样我们能在 ~30min 内看到 6 个验证点
+  limit_val_batches: 0.05
+  val_check_interval: 500
   check_val_every_n_epoch: 1
 
 # ----------------------------------------------------------------------------
@@ -208,9 +211,9 @@ logging:
       compute: false
       depth_metrics_every_n_steps: null
     log_model_every_n_steps: 5000
-    log_every_n_steps: 500
+    log_every_n_steps: 50
     high_dim:
-      enable: True
+      enable: False
       every_n_steps: 5000
       n_samples: 4
   

@@ -12,7 +12,12 @@ import torch.nn.functional as F
 
 from data.utils.types import LstmStates
 from models.backbone.base import BaseDetector
-from models.backbone.rnn import DWSConvLSTM2d, StandardConvLSTM2d
+from models.backbone.rnn import (
+    DWSConvLSTM2d,
+    DWSConvSTLSTM2d,
+    StandardConvLSTM2d,
+    _gn_num_groups,
+)
 
 
 def _relu_inplace() -> nn.ReLU:
@@ -42,8 +47,19 @@ def _build_convlstm(
             cell_update_dropout=drop,
             T_max_chrono_init=T_max_chrono_init,
         )
+    if t == "stlstm":
+        return DWSConvSTLSTM2d(
+            dim=dim,
+            dws_conv=lstm_cfg.get("dws_conv", True),
+            dws_conv_only_hidden=lstm_cfg.get("dws_conv_only_hidden", True),
+            dws_conv_kernel_size=lstm_cfg.get("dws_conv_kernel_size", 5),
+            dws_on_spatial_m=lstm_cfg.get("dws_on_spatial_m", True),
+            cell_update_dropout=drop,
+            T_max_chrono_init=T_max_chrono_init,
+            use_group_norm=lstm_cfg.get("use_group_norm", True),
+        )
     raise ValueError(
-        f"encoder_lstm_type must be 'stand_convlstm' or 'dws_convlstm', got {t!r}"
+        f"encoder_lstm_type must be 'stand_convlstm', 'dws_convlstm', or 'stlstm', got {t!r}"
     )
 
 
@@ -126,6 +142,46 @@ class E2DepthConvLSTMUNet(BaseDetector):
         self.enc_conv2 = _Conv_relu(128, 256, 5, 2, 2, use_bn)
         self.lstm2 = _build_convlstm(encoder_lstm_type, 256, lstm_cfg, t_vals[2])
 
+        # --- ST-LSTM zigzag wiring (PredRNN/PredRNN++ style) ---
+        self.cell_type = encoder_lstm_type
+        self.use_zigzag = (
+            encoder_lstm_type == "stlstm" and bool(lstm_cfg.get("zigzag", False))
+        )
+        self._encoder_dims = (64, 128, 256)
+        if self.use_zigzag:
+            d0, d1, d2 = self._encoder_dims
+            # Forward adapters: stage l M -> stage l+1 M (downsample 2x, expand channels)
+            self.m_adapters_forward = nn.ModuleList(
+                [
+                    nn.Sequential(
+                        nn.AvgPool2d(kernel_size=2, stride=2),
+                        nn.Conv2d(d0, d1, kernel_size=1, bias=False),
+                        nn.GroupNorm(_gn_num_groups(d1), d1),
+                        nn.SiLU(inplace=True),
+                    ),
+                    nn.Sequential(
+                        nn.AvgPool2d(kernel_size=2, stride=2),
+                        nn.Conv2d(d1, d2, kernel_size=1, bias=False),
+                        nn.GroupNorm(_gn_num_groups(d2), d2),
+                        nn.SiLU(inplace=True),
+                    ),
+                ]
+            )
+            # Zigzag: last stage (256, /8) at t-1 -> first stage (64, /2) at t
+            # 1x1 project channels, then bilinear upsample (in forward), then 5x5 dws refine.
+            g0 = _gn_num_groups(d0)
+            self.m_adapter_zigzag = nn.Sequential(
+                nn.Conv2d(d2, d0, kernel_size=1, bias=False),
+                nn.GroupNorm(g0, d0),
+                nn.SiLU(inplace=True),
+            )
+            self.m_adapter_zigzag_refine = nn.Sequential(
+                nn.Conv2d(d0, d0, kernel_size=5, padding=2, groups=d0, bias=False),
+                nn.GroupNorm(g0, d0),
+                nn.SiLU(inplace=True),
+                nn.Conv2d(d0, d0, kernel_size=1, bias=False),
+            )
+
         # --- Bottleneck ---
         self.bot_res = nn.Sequential(_ResidualBlock256(use_bn), _ResidualBlock256(use_bn))
 
@@ -171,28 +227,92 @@ class E2DepthConvLSTMUNet(BaseDetector):
         ho = self.head_bn(ho)
         head_feat = self.head_relu(ho)
 
-        e0 = self.enc_conv0(head_feat)
         s0_tuple = prev_states_list[0]
+        s1_tuple = prev_states_list[1]
+        s2_tuple = prev_states_list[2]
         h0_tuple = (
             None
             if s0_tuple is None or len(s0_tuple) < 2
             else (s0_tuple[0], s0_tuple[1])
         )
-        # lstm* 返回 (h_t, c_t)；须一并存入 state，否则会丢掉 h 并在下一步把 Tensor 误当 tuple 拆成 3D slice
-        e0_out, c0 = self.lstm0(e0, h0_tuple)
-        state0 = (e0_out, c0)
+        h1_tuple = (
+            None
+            if s1_tuple is None or len(s1_tuple) < 2
+            else (s1_tuple[0], s1_tuple[1])
+        )
+        h2_tuple = (
+            None
+            if s2_tuple is None or len(s2_tuple) < 2
+            else (s2_tuple[0], s2_tuple[1])
+        )
 
-        e1 = self.enc_conv1(e0_out)
-        s1 = prev_states_list[1]
-        h1_tuple = None if s1 is None or len(s1) < 2 else (s1[0], s1[1])
-        e1_out, c1 = self.lstm1(e1, h1_tuple)
-        state1 = (e1_out, c1)
+        is_stlstm = self.cell_type == "stlstm"
 
-        e2 = self.enc_conv2(e1_out)
-        s2 = prev_states_list[2]
-        h2_tuple = None if s2 is None or len(s2) < 2 else (s2[0], s2[1])
-        e2_out, c2 = self.lstm2(e2, h2_tuple)
-        state2 = (e2_out, c2)
+        if is_stlstm:
+            # Determine M fed into stage 0 — from zigzag link or stage-0's own t-1 M.
+            if self.use_zigzag:
+                m_for_lstm0: Optional[th.Tensor] = None
+                if s2_tuple is not None and len(s2_tuple) >= 3:
+                    m_last = self.m_adapter_zigzag(s2_tuple[2])
+                    e0_h = head_feat.shape[2] // 2
+                    e0_w = head_feat.shape[3] // 2
+                    m_last = F.interpolate(
+                        m_last,
+                        size=(e0_h, e0_w),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                    m_for_lstm0 = self.m_adapter_zigzag_refine(m_last)
+            else:
+                m_for_lstm0 = (
+                    s0_tuple[2]
+                    if s0_tuple is not None and len(s0_tuple) >= 3
+                    else None
+                )
+
+            e0 = self.enc_conv0(head_feat)
+            e0_out, c0, m0 = self.lstm0(e0, h0_tuple, m_for_lstm0)
+            state0 = (e0_out, c0, m0)
+
+            m_for_lstm1 = (
+                self.m_adapters_forward[0](m0)
+                if self.use_zigzag
+                else (
+                    s1_tuple[2]
+                    if s1_tuple is not None and len(s1_tuple) >= 3
+                    else None
+                )
+            )
+            e1 = self.enc_conv1(e0_out)
+            e1_out, c1, m1 = self.lstm1(e1, h1_tuple, m_for_lstm1)
+            state1 = (e1_out, c1, m1)
+
+            m_for_lstm2 = (
+                self.m_adapters_forward[1](m1)
+                if self.use_zigzag
+                else (
+                    s2_tuple[2]
+                    if s2_tuple is not None and len(s2_tuple) >= 3
+                    else None
+                )
+            )
+            e2 = self.enc_conv2(e1_out)
+            e2_out, c2, m2 = self.lstm2(e2, h2_tuple, m_for_lstm2)
+            state2 = (e2_out, c2, m2)
+        else:
+            # ConvLSTM path (legacy). lstm* 返回 (h_t, c_t)；
+            # 须一并存入 state，否则会丢掉 h 并在下一步把 Tensor 误当 tuple 拆成 3D slice。
+            e0 = self.enc_conv0(head_feat)
+            e0_out, c0 = self.lstm0(e0, h0_tuple)
+            state0 = (e0_out, c0)
+
+            e1 = self.enc_conv1(e0_out)
+            e1_out, c1 = self.lstm1(e1, h1_tuple)
+            state1 = (e1_out, c1)
+
+            e2 = self.enc_conv2(e1_out)
+            e2_out, c2 = self.lstm2(e2, h2_tuple)
+            state2 = (e2_out, c2)
 
         b = self.bot_res(e2_out)
 
